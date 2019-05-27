@@ -1,4 +1,4 @@
 .env
-.pem
+*.pem
 mjeeves-secret.yaml
 .idea/
