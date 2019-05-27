@@ -47,7 +47,7 @@ func (event ReminderEvent) SendReminderComment() error {
 	if err != nil {
 		panic(err)
 	}
-	itr, err := ghinstallation.NewKeyFromFile(tr, appId, int(event.InstallationID), "mjeeves.2019-05-26.private-key.pem")
+	itr, err := ghinstallation.NewKeyFromFile(tr, appId, int(event.InstallationID), os.Getenv("KEY_PATH"))
 	if err != nil {
 		panic(err)
 	}
@@ -55,16 +55,103 @@ func (event ReminderEvent) SendReminderComment() error {
 	client := github.NewClient(&http.Client{Transport: itr})
 	commentToWrite := fmt.Sprintf("Don't forget about this issue @%s!", event.CommentAuthor)
 
-	comment, _, err := client.Issues.CreateComment(context.Background(), event.RepoOwner, event.RepoName, event.IssueNumber, &github.IssueComment{
+	_, _, err = client.Issues.CreateComment(context.Background(), event.RepoOwner, event.RepoName, event.IssueNumber, &github.IssueComment{
 		Body: &commentToWrite,
 	})
 
-	fmt.Println(comment)
 	return err
 }
 
-func runAPI() {
+func runInstallationEvent(installationEvent *github.InstallationEvent) {
+	fmt.Println("Installing Now")
+	tr := http.DefaultTransport
+	appId, err := strconv.Atoi(os.Getenv("GITHUB_APP_IDENTIFIER"))
+	if err != nil {
+		panic(err)
+	}
+	itr, err := ghinstallation.NewKeyFromFile(tr, appId, int(*installationEvent.Installation.ID), os.Getenv("KEY_PATH"))
+	if err != nil {
+		panic(err)
+	}
+	github.NewClient(&http.Client{Transport: itr})
+}
 
+func runIssueEvent(installationEvent *github.IssueCommentEvent, remindMessageRe *regexp.Regexp, redisClient *redis.Client) {
+	fmt.Printf("Installing for %d\n", *(installationEvent.Installation.ID))
+	tr := http.DefaultTransport
+	appId, err := strconv.Atoi(os.Getenv("GITHUB_APP_IDENTIFIER"))
+	if err != nil {
+		panic(err)
+	}
+	itr, err := ghinstallation.NewKeyFromFile(tr, appId, int(*installationEvent.Installation.ID), os.Getenv("KEY_PATH"))
+	if err != nil {
+		panic(err)
+	}
+
+	client := github.NewClient(&http.Client{Transport: itr})
+	if *installationEvent.Action == "created" && strings.Contains(installationEvent.Comment.GetBody(), "/remind") {
+		var score float64
+		if remindMessageRe.MatchString(installationEvent.GetComment().GetBody()) {
+			fmt.Printf("Message: %s matched\n", installationEvent.GetComment().GetBody())
+			splitMessage := strings.Split(installationEvent.GetComment().GetBody(), " ")
+			increment, err := strconv.Atoi(splitMessage[1])
+			if err != nil {
+				panic(err)
+			}
+			unit := strings.ToLower(splitMessage[2])
+			var duration time.Duration
+			if strings.Contains(unit, "day") {
+				duration = time.Hour * 24 * time.Duration(increment)
+			} else if strings.Contains(unit, "hour") {
+				duration = time.Hour * time.Duration(increment)
+			} else {
+				duration = time.Minute * time.Duration(increment)
+			}
+
+			score = float64(time.Now().Add(duration).Unix())
+		} else {
+			score = float64(time.Now().Add(time.Minute * 10).Unix())
+		}
+
+		commentToWrite := "Alright I'll remind you!"
+		_, _, err := client.Issues.CreateComment(context.Background(), installationEvent.Repo.GetOwner().GetLogin(), installationEvent.Repo.GetName(), installationEvent.Issue.GetNumber(), &github.IssueComment{
+			Body: &commentToWrite,
+		})
+		if err != nil {
+			panic(err)
+		}
+
+		event := ReminderEvent{
+			InstallationID: installationEvent.Installation.GetID(),
+			IssueNumber:    installationEvent.Issue.GetNumber(),
+			CommentID:      installationEvent.Comment.GetID(),
+			RepoOwner:      installationEvent.Repo.GetOwner().GetLogin(),
+			RepoName:       installationEvent.Repo.GetName(),
+			CommentAuthor:  installationEvent.Comment.GetUser().GetLogin(),
+		}
+
+		redisClient.ZAdd("scheduled_reminders", redis.Z{
+			Score:  score,
+			Member: installationEvent.Comment.GetID(),
+		})
+
+		marshalledEvent, err := json.Marshal(event)
+		if err != nil {
+			panic(err)
+		}
+
+		key := strconv.Itoa(int(installationEvent.Comment.GetID()))
+
+		err = redisClient.Set(key, marshalledEvent, 0).Err()
+
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func runAPI() {
+	fmt.Println("Running API")
 	remindMessageRe, err := regexp.Compile(`\/remind \d* (day|hour|minute)`)
 
 	if err != nil {
@@ -84,86 +171,36 @@ func runAPI() {
 	})
 
 	router.POST("/event_handler", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("In Event Handler")
 		eventType := r.Header.Get("X-Github-Event")
 		fmt.Printf("Event Type: %s\n", eventType)
-		installationEvent := github.IssueCommentEvent{}
+		payload, err := github.ValidatePayload(r, []byte(os.Getenv("GITHUB_WEBHOOK_SECRET")))
 
-		err := json.NewDecoder(r.Body).Decode(&installationEvent)
 		if err != nil {
-			panic(err)
+			fmt.Printf("Error Validating Request Body: err=%s\n", err)
+			return
 		}
 
-		fmt.Printf("Installing for %d\n", *(installationEvent.Installation.ID))
-		tr := http.DefaultTransport
-		appId, err := strconv.Atoi(os.Getenv("GITHUB_APP_IDENTIFIER"))
-		if err != nil {
-			panic(err)
+		event, err := github.ParseWebHook(github.WebHookType(r), payload)
+
+		switch e := event.(type) {
+		case *github.InstallationEvent:
+			runInstallationEvent(e)
+		case *github.IssueCommentEvent:
+			runIssueEvent(e, remindMessageRe, redisClient)
+		default:
+			fmt.Printf("Unsupported event type %s\n", github.WebHookType(r))
+			return
 		}
-		itr, err := ghinstallation.NewKeyFromFile(tr, appId, int(*installationEvent.Installation.ID), "mjeeves.2019-05-26.private-key.pem")
-		if err != nil {
-			panic(err)
-		}
+		//err := json.NewDecoder(r.Body).Decode(&installationEvent)
+		//if err != nil {
+		//	panic(err)
+		//}
+		//
+		//payload, _ := json.Marshal(installationEvent)
+		//
+		//validateWebhookSignature(r.Header.Get("X-Hub-Signature"), payload)
 
-		client := github.NewClient(&http.Client{Transport: itr})
-		if eventType == "issue_comment" && *installationEvent.Action == "created" && strings.Contains(installationEvent.Comment.GetBody(), "/remind") {
-			var score float64
-			if remindMessageRe.MatchString(installationEvent.GetComment().GetBody()) {
-				fmt.Printf("Message: %s matched\n", installationEvent.GetComment().GetBody())
-				splitMessage := strings.Split(installationEvent.GetComment().GetBody(), " ")
-				increment, err := strconv.Atoi(splitMessage[1])
-				if err != nil {
-					panic(err)
-				}
-				unit := strings.ToLower(splitMessage[2])
-				var duration time.Duration
-				if strings.Contains(unit, "day") {
-					duration = time.Hour * 24 * time.Duration(increment)
-				} else if strings.Contains(unit, "hour") {
-					duration = time.Hour * time.Duration(increment)
-				} else {
-					duration = time.Minute * time.Duration(increment)
-				}
-
-				score = float64(time.Now().Add(duration).Unix())
-			} else {
-				score = float64(time.Now().Add(time.Minute * 10).Unix())
-			}
-
-			commentToWrite := "Alright I'll remind you!"
-			_, _, err := client.Issues.CreateComment(context.Background(), installationEvent.Repo.GetOwner().GetLogin(), installationEvent.Repo.GetName(), installationEvent.Issue.GetNumber(), &github.IssueComment{
-				Body: &commentToWrite,
-			})
-			if err != nil {
-				panic(err)
-			}
-
-			event := ReminderEvent{
-				InstallationID: installationEvent.Installation.GetID(),
-				IssueNumber:    installationEvent.Issue.GetNumber(),
-				CommentID:      installationEvent.Comment.GetID(),
-				RepoOwner:      installationEvent.Repo.GetOwner().GetLogin(),
-				RepoName:       installationEvent.Repo.GetName(),
-				CommentAuthor:  installationEvent.Comment.GetUser().GetLogin(),
-			}
-
-			redisClient.ZAdd("scheduled_reminders", redis.Z{
-				Score: score,
-				Member: installationEvent.Comment.GetID(),
-			})
-
-			marshalledEvent, err := json.Marshal(event)
-			if err != nil {
-				panic(err)
-			}
-
-			key := strconv.Itoa(int(installationEvent.Comment.GetID()))
-
-			err = redisClient.Set(key, marshalledEvent, 0).Err()
-
-			if err != nil {
-				panic(err)
-			}
-		}
 		fmt.Fprintf(w, "POST /event_handler token: %s", "a")
 	})
 
