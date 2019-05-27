@@ -9,7 +9,7 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o mjeeves
 
-FROM scratch
+FROM gcr.io/distroless/base
 COPY --from=builder /app/mjeeves /app/
 EXPOSE 3000
 ENTRYPOINT ["/app/mjeeves"]
