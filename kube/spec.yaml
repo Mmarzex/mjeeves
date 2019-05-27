@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jeeves-api
+  labels:
+    app: jeeves-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jeeves-api
+  template:
+    metadata:
+      labels:
+        app: jeeves-api
+    spec:
+      volumes:
+        - name: keys
+          secret:
+            secretName: mjeeves-key
+      imagePullSecrets:
+        - name: gitlabreg
+      containers:
+        - name: api
+          image: registry.gitlab.com/mmarzex/mjeeves:fe1bd38b
+          imagePullPolicy: Always
+          env:
+            - name: KEY_PATH
+              value: "/keys/GITHUB_PRIVATE_KEY"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: GITHUB_APP_IDENTIFIER
+              valueFrom:
+                secretKeyRef:
+                  key: GITHUB_APP_IDENTIFIER
+                  name: mjeeves
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: GITHUB_WEBHOOK_SECRET
+                  name: mjeeves
+          ports:
+            - containerPort: 3000
+              name: api-http
+          volumeMounts:
+            - mountPath: "/keys"
+              name: keys
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jeeves-worker
+  labels:
+    app: jeeves-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jeeves-worker
+  template:
+    metadata:
+      labels:
+        app: jeeves-worker
+    spec:
+      volumes:
+        - name: keys
+          secret:
+            secretName: mjeeves-key
+      imagePullSecrets:
+        - name: gitlabreg
+      containers:
+        - name: worker
+          image: registry.gitlab.com/mmarzex/mjeeves:fe1bd38b
+          imagePullPolicy: Always
+          args:
+            - "-run-workers"
+            - "true"
+          env:
+            - name: KEY_PATH
+              value: "/keys/GITHUB_PRIVATE_KEY"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: GITHUB_APP_IDENTIFIER
+              valueFrom:
+                secretKeyRef:
+                  key: GITHUB_APP_IDENTIFIER
+                  name: mjeeves
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: GITHUB_WEBHOOK_SECRET
+                  name: mjeeves
+          volumeMounts:
+            - mountPath: "/keys"
+              name: keys
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jeeves-api
+  labels:
+    app: jeeves-api
+spec:
+  ports:
+    - port: 3000
+      targetPort: 3000
+  selector:
+    app: jeeves-api
+---
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: jeeves-api-ingress
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+    - host: mjeeves-beta.marze.tech
+      http:
+        paths:
+          - backend:
+              serviceName: jeeves-api
+              servicePort: 3000
+
